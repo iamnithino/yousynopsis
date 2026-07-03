@@ -41,7 +41,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["yousynopsis-git-main-nithin-reddys-projects-d430f393.vercel.app"],
+    allow_origins=[
+    "https://yousynopsis-git-main-nithin-reddys-projects-d430f393.vercel.app"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
