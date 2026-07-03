@@ -32,7 +32,11 @@ from security import (
     verify_password,
 )
 
-app = FastAPI(title="AI Video Synopsis Generator API")
+app = FastAPI(
+    title="AI Video Synopsis Generator API",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
 app.add_middleware(
     CORSMiddleware,
