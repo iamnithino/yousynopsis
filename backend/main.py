@@ -324,7 +324,9 @@ def serialize_presentation(presentation: Presentation) -> dict[str, Any]:
 def transcript_error_response(exc: TranscriptUnavailableError) -> HTTPException:
     return HTTPException(status_code=exc.status_code, detail=str(exc))
 
-
+@app.get("/", include_in_schema=False)
+def redirect_to_docs():
+    return RedirectResponse(url="/docs")
 @app.get("/api/health")
 def health_check():
     return {"status": "ok"}
@@ -412,9 +414,7 @@ def admin_usage_dashboard(
         "totals": totals,
         "users": admin_users,
     }
-    @app.get("/", include_in_schema=False)
-def redirect_to_docs():
-    return RedirectResponse(url="/docs")
+    
 
 
 @app.post("/api/summarize")
