@@ -10,6 +10,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from fastapi.responses import RedirectResponse
 
 from database import SessionLocal, get_db
 from engine import (
@@ -411,6 +412,9 @@ def admin_usage_dashboard(
         "totals": totals,
         "users": admin_users,
     }
+    @app.get("/", include_in_schema=False)
+def redirect_to_docs():
+    return RedirectResponse(url="/docs")
 
 
 @app.post("/api/summarize")
