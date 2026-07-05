@@ -40,29 +40,8 @@ app = FastAPI(
 )
 
 default_allowed_origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:5174",
-    "http://127.0.0.1:5174",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "https://yousynopsis.vercel.app",
-]
 
-env_allowed_origins = [
-    origin.strip().rstrip("/")
-    for origin in os.environ.get("CORS_ORIGINS", "").split(",")
-    if origin.strip()
-]
-
-default_allowed_origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:5174",
-    "http://127.0.0.1:5174",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "https://yousynopsis.vercel.app",
+    "https://your-render-service.onrender.com",
 ]
 
 env_allowed_origins = [
