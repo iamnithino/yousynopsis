@@ -1,4 +1,4 @@
-﻿from typing import Any, Optional
+from typing import Any, Optional
 
 import datetime
 import os
@@ -38,6 +38,22 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc"
 )
+
+default_allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://yousynopsis.vercel.app",
+]
+
+env_allowed_origins = [
+    origin.strip().rstrip("/")
+    for origin in os.environ.get("CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
 
 default_allowed_origins = [
     "http://localhost:5173",
@@ -430,8 +446,9 @@ def admin_usage_dashboard(
         "totals": totals,
         "users": admin_users,
     }
-    
-
+@app.get("/", include_in_schema=False)
+def redirect_to_docs():
+    return RedirectResponse(url="/docs")
 
 @app.post("/api/summarize")
 async def summarize_video(
