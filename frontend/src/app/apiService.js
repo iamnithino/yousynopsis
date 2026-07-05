@@ -1,5 +1,4 @@
-const API_BASE_URL = 
-  import.meta.env.VITE_API_BASE_URL || "https://yousynopsis.onrender.com";
+const API_BASE_URL = "https://yousynopsis.onrender.com";
 
 function getToken() {
   return localStorage.getItem("token");
