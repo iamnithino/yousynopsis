@@ -1,7 +1,10 @@
 import html
 import json
+import logging
 import os
+import random
 import re
+import time
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -19,12 +22,17 @@ from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     VideoUnavailable,
 )
+from youtube_transcript_api.proxies import GenericProxyConfig, ProxyConfig, WebshareProxyConfig
 
 load_dotenv()
 
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.cerebras.ai/v1")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-oss-120b")
 MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "28000"))
+TRANSCRIPT_REQUEST_TIMEOUT = float(os.getenv("TRANSCRIPT_REQUEST_TIMEOUT", "20"))
+TRANSCRIPT_RETRY_ATTEMPTS = int(os.getenv("TRANSCRIPT_RETRY_ATTEMPTS", "3"))
+
+logger = logging.getLogger(__name__)
 
 
 USE_CASE_GUIDANCE = {
@@ -342,8 +350,68 @@ def _fetched_transcript_to_segments(fetched_transcript: Any) -> list[dict[str, A
     return segments
 
 
-def _fetch_transcript(video_id: str) -> Any:
-    transcript_api = YouTubeTranscriptApi()
+class TimeoutSession(requests.Session):
+    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        kwargs.setdefault("timeout", TRANSCRIPT_REQUEST_TIMEOUT)
+        return super().request(method, url, **kwargs)
+
+
+def _split_env_values(value: Optional[str]) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in re.split(r"[,;\s]+", value) if item.strip()]
+
+
+def _proxy_url(username: str, password: str, host: str, port: str) -> str:
+    return f"http://{username}:{password}@{host}:{port}"
+
+
+def _configured_proxy() -> tuple[Optional[ProxyConfig], str]:
+    username = os.getenv("WEBSHARE_PROXY_USERNAME", "").strip()
+    password = os.getenv("WEBSHARE_PROXY_PASSWORD", "").strip()
+    hosts = _split_env_values(os.getenv("WEBSHARE_PROXY_HOST"))
+    ports = _split_env_values(os.getenv("WEBSHARE_PROXY_PORT"))
+
+    if not username or not password:
+        return None, "direct"
+
+    if hosts:
+        endpoints: list[tuple[str, str]] = []
+        default_port = ports[0] if len(ports) == 1 else "80"
+        for index, host in enumerate(hosts):
+            proxy_host = host
+            proxy_port = ports[index] if index < len(ports) else default_port
+            if ":" in proxy_host and not proxy_host.startswith("["):
+                proxy_host, embedded_port = proxy_host.rsplit(":", 1)
+                proxy_port = embedded_port or proxy_port
+            endpoints.append((proxy_host, proxy_port))
+
+        host, port = random.choice(endpoints)
+        proxy_url = _proxy_url(username, password, host, port)
+        logger.info("Using Webshare transcript proxy via configured endpoint %s:%s", host, port)
+        return GenericProxyConfig(http_url=proxy_url, https_url=proxy_url), f"proxy {host}:{port}"
+
+    logger.info("Using Webshare rotating transcript proxy")
+    return (
+        WebshareProxyConfig(
+            proxy_username=username,
+            proxy_password=password,
+            retries_when_blocked=0,
+        ),
+        "webshare rotating proxy",
+    )
+
+
+def _transcript_api(proxy_config: Optional[ProxyConfig]) -> YouTubeTranscriptApi:
+    return YouTubeTranscriptApi(proxy_config=proxy_config, http_client=TimeoutSession())
+
+
+def _sleep_before_retry(attempt: int) -> None:
+    time.sleep(min(0.5 * attempt, 2.0))
+
+
+def _fetch_transcript_once(video_id: str, proxy_config: Optional[ProxyConfig]) -> Any:
+    transcript_api = _transcript_api(proxy_config)
 
     if hasattr(transcript_api, "list"):
         transcript_list = transcript_api.list(video_id)
@@ -368,12 +436,45 @@ def _fetch_transcript(video_id: str) -> Any:
     return YouTubeTranscriptApi.get_transcript(video_id, languages=PREFERRED_TRANSCRIPT_LANGUAGES)
 
 
+def _fetch_transcript(video_id: str) -> tuple[Any, str]:
+    last_error: Optional[Exception] = None
+    attempts = max(1, TRANSCRIPT_RETRY_ATTEMPTS)
+    for attempt in range(1, attempts + 1):
+        proxy_config, connection_label = _configured_proxy()
+        logger.info("Fetching YouTube transcript using %s on attempt %s/%s", connection_label, attempt, attempts)
+        try:
+            fetched_transcript = _fetch_transcript_once(video_id, proxy_config)
+            logger.info(
+                "YouTube transcript fetch succeeded using %s on attempt %s/%s",
+                connection_label,
+                attempt,
+                attempts,
+            )
+            return fetched_transcript, connection_label
+        except (NoTranscriptFound, TranscriptsDisabled, AgeRestricted, InvalidVideoId, VideoUnavailable):
+            raise
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "YouTube transcript fetch failed using %s on attempt %s/%s: %s",
+                connection_label,
+                attempt,
+                attempts,
+                exc.__class__.__name__,
+            )
+            if attempt < attempts:
+                _sleep_before_retry(attempt)
+
+    assert last_error is not None
+    raise last_error
+
+
 def get_video_transcript(youtube_url: str) -> dict[str, Any]:
     video_id = _extract_youtube_video_id(youtube_url)
     metadata = _video_metadata(youtube_url, video_id)
 
     try:
-        fetched_transcript = _fetch_transcript(video_id)
+        fetched_transcript, connection_label = _fetch_transcript(video_id)
         segments = _fetched_transcript_to_segments(fetched_transcript)
     except (NoTranscriptFound, TranscriptsDisabled) as exc:
         raise TranscriptUnavailableError(
@@ -392,7 +493,7 @@ def get_video_transcript(youtube_url: str) -> dict[str, Any]:
         ) from exc
     except (RequestBlocked, IpBlocked) as exc:
         raise TranscriptUnavailableError(
-            "YouTube is temporarily blocking transcript requests from this server. Please try again shortly or use another video with captions enabled.",
+            "YouTube is temporarily blocking transcript requests from this server, even after retrying the configured transcript connection. Please try again shortly or use another video with captions enabled.",
             status_code=429,
         ) from exc
     except CouldNotRetrieveTranscript as exc:
@@ -401,7 +502,7 @@ def get_video_transcript(youtube_url: str) -> dict[str, Any]:
         ) from exc
     except Exception as exc:
         raise TranscriptUnavailableError(
-            "Could not read captions for this video. Please try again shortly or use another video with captions enabled."
+            "Could not read captions for this video after retrying the transcript connection. Please try again shortly or use another video with captions enabled."
         ) from exc
 
     if not segments:
