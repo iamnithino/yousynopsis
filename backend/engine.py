@@ -1,13 +1,24 @@
-﻿import html
+import html
 import json
 import os
 import re
 from typing import Any, Optional
+from urllib.parse import parse_qs, urlparse
 
 import requests
-import yt_dlp
 from dotenv import load_dotenv
 from openai import OpenAI
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import (
+    AgeRestricted,
+    CouldNotRetrieveTranscript,
+    InvalidVideoId,
+    IpBlocked,
+    NoTranscriptFound,
+    RequestBlocked,
+    TranscriptsDisabled,
+    VideoUnavailable,
+)
 
 load_dotenv()
 
@@ -228,105 +239,187 @@ def build_caption_windows(
     return windows
 
 
-def _caption_candidates(info: dict[str, Any]) -> list[dict[str, Any]]:
-    subtitle_groups = []
-    for captions_key in ("subtitles", "automatic_captions"):
-        captions = info.get(captions_key) or {}
-        for language in ("en", "en-US", "en-GB"):
-            if language in captions:
-                subtitle_groups.extend(captions[language])
-        for language, tracks in captions.items():
-            if language not in {"en", "en-US", "en-GB"}:
-                subtitle_groups.extend(tracks)
-
-    preferred = []
-    for ext in ("json3", "vtt", "srv3", "ttml"):
-        preferred.extend(track for track in subtitle_groups if track.get("ext") == ext)
-    preferred.extend(track for track in subtitle_groups if track not in preferred)
-    return preferred
+PREFERRED_TRANSCRIPT_LANGUAGES = ["en", "en-US", "en-GB"]
+YOUTUBE_VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
-def get_video_transcript(youtube_url: str) -> dict[str, Any]:
-    ydl_opts = {
-        "quiet": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "extractor_retries": 2,
-        "socket_timeout": 20,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        },
+def _extract_youtube_video_id(youtube_url: str) -> str:
+    value = (youtube_url or "").strip()
+    if YOUTUBE_VIDEO_ID_PATTERN.fullmatch(value):
+        return value
+
+    parsed = urlparse(value)
+    host = parsed.netloc.lower()
+    path_parts = [part for part in parsed.path.split("/") if part]
+
+    query_video_id = parse_qs(parsed.query).get("v", [""])[0]
+    if YOUTUBE_VIDEO_ID_PATTERN.fullmatch(query_video_id):
+        return query_video_id
+
+    if host.endswith("youtu.be") and path_parts and YOUTUBE_VIDEO_ID_PATTERN.fullmatch(path_parts[0]):
+        return path_parts[0]
+
+    if host.endswith("youtube.com") or host.endswith("youtube-nocookie.com"):
+        for marker in ("shorts", "embed", "live", "v"):
+            if marker in path_parts:
+                index = path_parts.index(marker)
+                if len(path_parts) > index + 1 and YOUTUBE_VIDEO_ID_PATTERN.fullmatch(path_parts[index + 1]):
+                    return path_parts[index + 1]
+
+    match = re.search(r"(?:v=|youtu\.be/|shorts/|embed/|live/|/v/)([A-Za-z0-9_-]{11})", value)
+    if match:
+        return match.group(1)
+
+    raise TranscriptUnavailableError(
+        "Invalid YouTube URL. Please provide a valid YouTube video link.",
+        status_code=400,
+    )
+
+
+def _video_metadata(youtube_url: str, video_id: str) -> dict[str, Any]:
+    canonical_url = f"https://www.youtube.com/watch?v={video_id}"
+    metadata = {
+        "title": "YouTube Video",
+        "channel": "",
+        "duration": None,
+        "thumbnail": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
     }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(youtube_url, download=False)
-    except Exception as exc:
-        raise TranscriptUnavailableError(
-            "Could not read this YouTube video. Please check the URL, try again shortly, or use another video with captions enabled."
-        ) from exc
+        response = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": youtube_url if urlparse(youtube_url).netloc else canonical_url, "format": "json"},
+            timeout=10,
+            headers={"Accept": "application/json"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.exceptions.RequestException:
+        return metadata
+    except ValueError:
+        return metadata
 
-    rate_limited = False
-    caption_errors: list[str] = []
-    for track in _caption_candidates(info):
-        caption_url = track.get("url")
-        if not caption_url:
+    return {
+        "title": payload.get("title") or metadata["title"],
+        "channel": payload.get("author_name") or metadata["channel"],
+        "duration": None,
+        "thumbnail": payload.get("thumbnail_url") or metadata["thumbnail"],
+    }
+
+
+def _fetched_transcript_to_segments(fetched_transcript: Any) -> list[dict[str, Any]]:
+    if hasattr(fetched_transcript, "to_raw_data"):
+        raw_items = fetched_transcript.to_raw_data()
+    else:
+        raw_items = fetched_transcript
+
+    segments = []
+    for item in raw_items:
+        if isinstance(item, dict):
+            text = item.get("text", "")
+            start = float(item.get("start") or 0)
+            duration = float(item.get("duration") or 0)
+        else:
+            text = getattr(item, "text", "")
+            start = float(getattr(item, "start", 0) or 0)
+            duration = float(getattr(item, "duration", 0) or 0)
+
+        text = _clean_caption_text(text)
+        if not text:
             continue
 
-        try:
-            response = requests.get(caption_url, timeout=20, headers=ydl_opts["http_headers"])
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as exc:
-            status_code = exc.response.status_code if exc.response is not None else None
-            if status_code == 429:
-                rate_limited = True
-            else:
-                caption_errors.append(f"caption request failed with status {status_code or 'unknown'}")
-            continue
-        except requests.exceptions.RequestException:
-            caption_errors.append("caption request failed")
-            continue
-        raw = response.text
-
-        try:
-            if track.get("ext") == "json3" or raw.lstrip().startswith("{"):
-                segments = _parse_json3_captions(raw)
-            else:
-                segments = _parse_vtt_captions(raw)
-        except Exception:
-            segments = _parse_vtt_captions(raw)
-
-        if segments:
-            return {
-                "title": info.get("title") or "YouTube Video",
-                "channel": info.get("uploader") or info.get("channel") or "",
-                "duration": info.get("duration"),
-                "thumbnail": info.get("thumbnail") or "",
-                "transcript": " ".join(segment["text"] for segment in segments),
-                "caption_segments": segments,
-                "caption_windows": build_caption_windows(segments, info.get("duration")),
+        end = start + duration if duration else start
+        segments.append(
+            {
+                "time": _seconds_to_time(start),
+                "end_time": _seconds_to_time(end),
+                "start_seconds": start,
+                "end_seconds": end,
+                "text": text,
             }
-
-    if rate_limited:
-        raise TranscriptUnavailableError(
-            "YouTube is rate limiting transcript requests right now. Please wait a minute and try again, or compare different videos.",
-            status_code=429,
         )
 
-    if caption_errors:
+    return segments
+
+
+def _fetch_transcript(video_id: str) -> Any:
+    transcript_api = YouTubeTranscriptApi()
+
+    if hasattr(transcript_api, "list"):
+        transcript_list = transcript_api.list(video_id)
+        try:
+            transcript = transcript_list.find_manually_created_transcript(PREFERRED_TRANSCRIPT_LANGUAGES)
+        except NoTranscriptFound:
+            try:
+                transcript = transcript_list.find_generated_transcript(PREFERRED_TRANSCRIPT_LANGUAGES)
+            except NoTranscriptFound:
+                transcript = None
+
+        if transcript is None:
+            for available_transcript in transcript_list:
+                transcript = available_transcript
+                break
+
+        if transcript is None:
+            raise NoTranscriptFound(video_id, PREFERRED_TRANSCRIPT_LANGUAGES, transcript_list)
+
+        return transcript.fetch()
+
+    return YouTubeTranscriptApi.get_transcript(video_id, languages=PREFERRED_TRANSCRIPT_LANGUAGES)
+
+
+def get_video_transcript(youtube_url: str) -> dict[str, Any]:
+    video_id = _extract_youtube_video_id(youtube_url)
+    metadata = _video_metadata(youtube_url, video_id)
+
+    try:
+        fetched_transcript = _fetch_transcript(video_id)
+        segments = _fetched_transcript_to_segments(fetched_transcript)
+    except (NoTranscriptFound, TranscriptsDisabled) as exc:
+        raise TranscriptUnavailableError(
+            "No captions were found for this video. Try a YouTube video with captions or automatic captions enabled.",
+            status_code=422,
+        ) from exc
+    except AgeRestricted as exc:
+        raise TranscriptUnavailableError(
+            "This video is age-restricted, so its captions cannot be retrieved without YouTube authentication.",
+            status_code=422,
+        ) from exc
+    except (InvalidVideoId, VideoUnavailable) as exc:
+        raise TranscriptUnavailableError(
+            "Could not read this YouTube video. Please check the URL or try another video with captions enabled.",
+            status_code=422,
+        ) from exc
+    except (RequestBlocked, IpBlocked) as exc:
+        raise TranscriptUnavailableError(
+            "YouTube is temporarily blocking transcript requests from this server. Please try again shortly or use another video with captions enabled.",
+            status_code=429,
+        ) from exc
+    except CouldNotRetrieveTranscript as exc:
         raise TranscriptUnavailableError(
             "Could not download captions for this video. Please try again shortly or use another video with captions enabled."
+        ) from exc
+    except Exception as exc:
+        raise TranscriptUnavailableError(
+            "Could not read captions for this video. Please try again shortly or use another video with captions enabled."
+        ) from exc
+
+    if not segments:
+        raise TranscriptUnavailableError(
+            "No usable captions were found for this video. Try a YouTube video with captions or automatic captions enabled.",
+            status_code=422,
         )
 
-    raise TranscriptUnavailableError(
-        "No captions were found for this video. Try a YouTube video with captions or automatic captions enabled.",
-        status_code=422,
-    )
+    duration = int(max(segment.get("end_seconds", 0) for segment in segments)) if segments else None
+    return {
+        "title": metadata["title"],
+        "channel": metadata["channel"],
+        "duration": duration,
+        "thumbnail": metadata["thumbnail"],
+        "transcript": " ".join(segment["text"] for segment in segments),
+        "caption_segments": segments,
+        "caption_windows": build_caption_windows(segments, duration),
+    }
 
 
 async def generate_synopsis(
