@@ -1,48 +1,28 @@
-import html
+﻿import html
 import json
 import logging
 import os
-import random
 import re
-import time
 from typing import Any, Optional
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from dotenv import load_dotenv
 from openai import OpenAI
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import (
-    AgeRestricted,
-    CouldNotRetrieveTranscript,
-    InvalidVideoId,
-    IpBlocked,
-    NoTranscriptFound,
-    RequestBlocked,
-    TranscriptsDisabled,
-    VideoUnavailable,
-)
-from youtube_transcript_api.proxies import GenericProxyConfig, ProxyConfig, WebshareProxyConfig
 
 load_dotenv()
 
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.cerebras.ai/v1")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-oss-120b")
 MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "28000"))
-TRANSCRIPT_REQUEST_TIMEOUT = float(os.getenv("TRANSCRIPT_REQUEST_TIMEOUT", "20"))
-TRANSCRIPT_RETRY_ATTEMPTS = int(os.getenv("TRANSCRIPT_RETRY_ATTEMPTS", "3"))
-PIPED_API_INSTANCES = [
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.adminforge.de",
-    "https://pipedapi.syncpundit.io",
-    "https://pipedapi.privacy.com.de",
-]
-INVIDIOUS_API_INSTANCES = [
-    "https://yewtu.be",
-    "https://inv.nadeko.net",
-    "https://invidious.privacyredirect.com",
-    "https://vid.puffyan.us",
-]
+TRANSCRIPT_SERVICE_HOST = os.getenv("TRANSCRIPT_SERVICE_HOST", "").strip()
+TRANSCRIPT_SERVICE_PORT = os.getenv("TRANSCRIPT_SERVICE_PORT", "3001").strip()
+TRANSCRIPT_SERVICE_URL = (
+    os.getenv("TRANSCRIPT_SERVICE_URL")
+    or (f"http://{TRANSCRIPT_SERVICE_HOST}:{TRANSCRIPT_SERVICE_PORT}" if TRANSCRIPT_SERVICE_HOST else None)
+    or "http://transcript-service:3001"
+).rstrip("/")
+TRANSCRIPT_SERVICE_TIMEOUT = float(os.getenv("TRANSCRIPT_SERVICE_TIMEOUT", "30"))
 
 logger = logging.getLogger(__name__)
 
@@ -156,129 +136,14 @@ def _seconds_to_time(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def _time_to_seconds(timestamp: str) -> float:
-    parts = timestamp.replace(",", ".").split(":")
-    if len(parts) == 3:
-        hours, minutes, seconds = parts
-        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
-    minutes, seconds = parts
-    return int(minutes) * 60 + float(seconds)
-
-
 def _clean_caption_text(text: str) -> str:
     text = re.sub(r"<[^>]+>", "", text)
     text = html.unescape(text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
-
-def _parse_json3_captions(raw: str) -> list[dict[str, Any]]:
-    payload = json.loads(raw)
-    segments = []
-    for event in payload.get("events", []):
-        text = "".join(seg.get("utf8", "") for seg in event.get("segs", []))
-        text = _clean_caption_text(text)
-        if not text:
-            continue
-        start = event.get("tStartMs", 0) / 1000
-        duration = event.get("dDurationMs", 0) / 1000
-        end = start + duration if duration else start
-        segments.append(
-            {
-                "time": _seconds_to_time(start),
-                "end_time": _seconds_to_time(end),
-                "start_seconds": start,
-                "end_seconds": end,
-                "text": text,
-            }
-        )
-    return segments
-
-
-def _parse_vtt_captions(raw: str) -> list[dict[str, Any]]:
-    blocks = re.split(r"\n\s*\n", raw.replace("\r\n", "\n"))
-    segments = []
-    time_pattern = re.compile(
-        r"(?P<start>(?:\d{2}:)?\d{2}:\d{2}[.,]\d{3})\s+-->\s+(?P<end>(?:\d{2}:)?\d{2}:\d{2}[.,]\d{3})"
-    )
-    for block in blocks:
-        match = time_pattern.search(block)
-        if not match:
-            continue
-        text_lines = [
-            line.strip()
-            for line in block.splitlines()
-            if line.strip() and "-->" not in line and not line.strip().isdigit()
-        ]
-        text = _clean_caption_text(" ".join(text_lines))
-        if not text:
-            continue
-        start = _time_to_seconds(match.group("start"))
-        end = _time_to_seconds(match.group("end"))
-        segments.append(
-            {
-                "time": _seconds_to_time(start),
-                "end_time": _seconds_to_time(end),
-                "start_seconds": start,
-                "end_seconds": end,
-                "text": text,
-            }
-        )
-    return segments
-
-
-def _parse_xml_captions(raw: str) -> list[dict[str, Any]]:
-    try:
-        import xml.etree.ElementTree as ElementTree
-
-        root = ElementTree.fromstring(raw)
-    except Exception:
-        return []
-
-    segments = []
-    for node in root.iter():
-        if node.tag.split("}")[-1] not in {"text", "p"}:
-            continue
-        text = _clean_caption_text("".join(node.itertext()))
-        if not text:
-            continue
-        start = float(node.attrib.get("start") or node.attrib.get("t") or 0)
-        duration = float(node.attrib.get("dur") or node.attrib.get("d") or 0)
-        if "t" in node.attrib:
-            start = start / 1000
-        if "d" in node.attrib:
-            duration = duration / 1000
-        end = start + duration if duration else start
-        segments.append(
-            {
-                "time": _seconds_to_time(start),
-                "end_time": _seconds_to_time(end),
-                "start_seconds": start,
-                "end_seconds": end,
-                "text": text,
-            }
-        )
-    return segments
-
-
-def _parse_caption_payload(raw: str, content_type: str = "") -> list[dict[str, Any]]:
-    stripped = raw.lstrip()
-    if not stripped:
-        return []
-    if "json" in content_type or stripped.startswith("{"):
-        try:
-            return _parse_json3_captions(raw)
-        except Exception:
-            pass
-    if "xml" in content_type or stripped.startswith("<"):
-        segments = _parse_xml_captions(raw)
-        if segments:
-            return segments
-    return _parse_vtt_captions(raw)
-
-
 def build_caption_windows(
-    segments: list[dict[str, Any]], duration: Optional[int] = None, window_seconds: int = 30
+    segments: list[dict[str, Any]], duration: Optional[int] = None, window_seconds: int = 45
 ) -> list[dict[str, Any]]:
     if not segments:
         return []
@@ -309,7 +174,6 @@ def build_caption_windows(
     return windows
 
 
-PREFERRED_TRANSCRIPT_LANGUAGES = ["en", "en-US", "en-GB"]
 YOUTUBE_VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
@@ -377,34 +241,37 @@ def _video_metadata(youtube_url: str, video_id: str) -> dict[str, Any]:
     }
 
 
-def _fetched_transcript_to_segments(fetched_transcript: Any) -> list[dict[str, Any]]:
-    if hasattr(fetched_transcript, "to_raw_data"):
-        raw_items = fetched_transcript.to_raw_data()
-    else:
-        raw_items = fetched_transcript
-
+def _normalize_caption_segments(raw_segments: Any, transcript: str) -> list[dict[str, Any]]:
     segments = []
-    for item in raw_items:
-        if isinstance(item, dict):
-            text = item.get("text", "")
-            start = float(item.get("start") or 0)
-            duration = float(item.get("duration") or 0)
-        else:
-            text = getattr(item, "text", "")
-            start = float(getattr(item, "start", 0) or 0)
-            duration = float(getattr(item, "duration", 0) or 0)
+    if isinstance(raw_segments, list):
+        for item in raw_segments:
+            if not isinstance(item, dict):
+                continue
+            text = _clean_caption_text(str(item.get("text") or ""))
+            if not text:
+                continue
+            start = float(item.get("start_seconds") or item.get("start") or 0)
+            end = float(item.get("end_seconds") or item.get("end") or start)
+            if end < start:
+                end = start
+            segments.append(
+                {
+                    "time": item.get("time") or _seconds_to_time(start),
+                    "end_time": item.get("end_time") or _seconds_to_time(end),
+                    "start_seconds": start,
+                    "end_seconds": end,
+                    "text": text,
+                }
+            )
 
-        text = _clean_caption_text(text)
-        if not text:
-            continue
-
-        end = start + duration if duration else start
+    if not segments and transcript.strip():
+        text = _clean_caption_text(transcript)
         segments.append(
             {
-                "time": _seconds_to_time(start),
-                "end_time": _seconds_to_time(end),
-                "start_seconds": start,
-                "end_seconds": end,
+                "time": "00:00",
+                "end_time": "00:00",
+                "start_seconds": 0,
+                "end_seconds": 0,
                 "text": text,
             }
         )
@@ -412,321 +279,95 @@ def _fetched_transcript_to_segments(fetched_transcript: Any) -> list[dict[str, A
     return segments
 
 
-class TimeoutSession(requests.Session):
-    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
-        kwargs.setdefault("timeout", TRANSCRIPT_REQUEST_TIMEOUT)
-        return super().request(method, url, **kwargs)
-
-
-def _split_env_values(value: Optional[str]) -> list[str]:
-    if not value:
-        return []
-    return [item.strip() for item in re.split(r"[,;\s]+", value) if item.strip()]
-
-
-def _configured_instances(env_name: str, defaults: list[str]) -> list[str]:
-    instances = _split_env_values(os.getenv(env_name)) or defaults
-    normalized = [instance.rstrip("/") for instance in instances if instance.strip()]
-    random.shuffle(normalized)
-    return normalized
-
-
-def _proxy_url(username: str, password: str, host: str, port: str) -> str:
-    return f"http://{username}:{password}@{host}:{port}"
-
-
-def _configured_proxy() -> tuple[Optional[ProxyConfig], str]:
-    username = os.getenv("WEBSHARE_PROXY_USERNAME", "").strip()
-    password = os.getenv("WEBSHARE_PROXY_PASSWORD", "").strip()
-    hosts = _split_env_values(os.getenv("WEBSHARE_PROXY_HOST"))
-    ports = _split_env_values(os.getenv("WEBSHARE_PROXY_PORT"))
-
-    if not username or not password:
-        return None, "direct"
-
-    if hosts:
-        endpoints: list[tuple[str, str]] = []
-        default_port = ports[0] if len(ports) == 1 else "80"
-        for index, host in enumerate(hosts):
-            proxy_host = host
-            proxy_port = ports[index] if index < len(ports) else default_port
-            if ":" in proxy_host and not proxy_host.startswith("["):
-                proxy_host, embedded_port = proxy_host.rsplit(":", 1)
-                proxy_port = embedded_port or proxy_port
-            endpoints.append((proxy_host, proxy_port))
-
-        host, port = random.choice(endpoints)
-        proxy_url = _proxy_url(username, password, host, port)
-        logger.info("Using Webshare transcript proxy via configured endpoint %s:%s", host, port)
-        return GenericProxyConfig(http_url=proxy_url, https_url=proxy_url), f"proxy {host}:{port}"
-
-    logger.info("Using Webshare rotating transcript proxy")
-    return (
-        WebshareProxyConfig(
-            proxy_username=username,
-            proxy_password=password,
-            retries_when_blocked=0,
-        ),
-        "webshare rotating proxy",
+def _is_caption_unavailable_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "caption",
+            "subtitle",
+            "transcript",
+            "no usable",
+            "not available",
+            "unavailable",
+            "disabled",
+            "private",
+            "deleted",
+        )
     )
 
 
-def _transcript_api(proxy_config: Optional[ProxyConfig]) -> YouTubeTranscriptApi:
-    return YouTubeTranscriptApi(proxy_config=proxy_config, http_client=TimeoutSession())
-
-
-def _sleep_before_retry(attempt: int) -> None:
-    time.sleep(min(0.5 * attempt, 2.0))
-
-
-def _fetch_transcript_once(video_id: str, proxy_config: Optional[ProxyConfig]) -> Any:
-    transcript_api = _transcript_api(proxy_config)
-
-    if hasattr(transcript_api, "list"):
-        transcript_list = transcript_api.list(video_id)
-        try:
-            transcript = transcript_list.find_manually_created_transcript(PREFERRED_TRANSCRIPT_LANGUAGES)
-        except NoTranscriptFound:
-            try:
-                transcript = transcript_list.find_generated_transcript(PREFERRED_TRANSCRIPT_LANGUAGES)
-            except NoTranscriptFound:
-                transcript = None
-
-        if transcript is None:
-            for available_transcript in transcript_list:
-                transcript = available_transcript
-                break
-
-        if transcript is None:
-            raise NoTranscriptFound(video_id, PREFERRED_TRANSCRIPT_LANGUAGES, transcript_list)
-
-        return transcript.fetch()
-
-    return YouTubeTranscriptApi.get_transcript(video_id, languages=PREFERRED_TRANSCRIPT_LANGUAGES)
-
-
-def _fetch_transcript(video_id: str) -> tuple[Any, str]:
-    last_error: Optional[Exception] = None
-    attempts = max(1, TRANSCRIPT_RETRY_ATTEMPTS)
-    for attempt in range(1, attempts + 1):
-        proxy_config, connection_label = _configured_proxy()
-        logger.info("Fetching YouTube transcript using %s on attempt %s/%s", connection_label, attempt, attempts)
-        try:
-            fetched_transcript = _fetch_transcript_once(video_id, proxy_config)
-            logger.info(
-                "YouTube transcript fetch succeeded using %s on attempt %s/%s",
-                connection_label,
-                attempt,
-                attempts,
-            )
-            return fetched_transcript, connection_label
-        except (NoTranscriptFound, TranscriptsDisabled, AgeRestricted, InvalidVideoId, VideoUnavailable):
-            raise
-        except Exception as exc:
-            last_error = exc
-            logger.warning(
-                "YouTube transcript fetch failed using %s on attempt %s/%s: %s",
-                connection_label,
-                attempt,
-                attempts,
-                exc.__class__.__name__,
-            )
-            if attempt < attempts:
-                _sleep_before_retry(attempt)
-
-    assert last_error is not None
-    raise last_error
-
-
-def _caption_track_score(track: dict[str, Any]) -> tuple[int, int]:
-    language = str(track.get("code") or track.get("languageCode") or track.get("lang") or "").lower()
-    label = str(track.get("name") or track.get("label") or track.get("language") or "").lower()
-    is_english = language.startswith("en") or "english" in label
-    is_generated = bool(track.get("autoGenerated") or track.get("auto_generated") or "auto" in label)
-    return (0 if is_english else 1, 1 if is_generated else 0)
-
-
-def _caption_url(track: dict[str, Any], base_url: str) -> str:
-    caption_url = str(track.get("url") or track.get("captionUrl") or track.get("caption_url") or "")
-    if not caption_url:
-        return ""
-    if caption_url.startswith("//"):
-        return f"https:{caption_url}"
-    return urljoin(f"{base_url}/", caption_url)
-
-
-def _download_caption_segments(caption_url: str) -> list[dict[str, Any]]:
-    response = requests.get(
-        caption_url,
-        timeout=TRANSCRIPT_REQUEST_TIMEOUT,
-        headers={"User-Agent": "Mozilla/5.0", "Accept": "text/vtt,application/xml,application/json,text/plain,*/*"},
-    )
-    response.raise_for_status()
-    return _parse_caption_payload(response.text, response.headers.get("content-type", ""))
-
-
-def _try_caption_tracks(base_url: str, tracks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    for track in sorted(tracks, key=_caption_track_score):
-        caption_url = _caption_url(track, base_url)
-        if not caption_url:
-            continue
-        try:
-            segments = _download_caption_segments(caption_url)
-            if segments:
-                return segments
-        except requests.exceptions.RequestException as exc:
-            logger.warning("Caption mirror download failed from %s: %s", base_url, exc.__class__.__name__)
-        except Exception as exc:
-            logger.warning("Caption mirror parse failed from %s: %s", base_url, exc.__class__.__name__)
-    return []
-
-
-def _fetch_piped_transcript(video_id: str) -> Optional[dict[str, Any]]:
-    for base_url in _configured_instances("PIPED_API_INSTANCES", PIPED_API_INSTANCES):
-        try:
-            response = requests.get(f"{base_url}/streams/{video_id}", timeout=TRANSCRIPT_REQUEST_TIMEOUT)
-            response.raise_for_status()
-            payload = response.json()
-        except requests.exceptions.RequestException as exc:
-            logger.warning("Piped transcript mirror failed at %s: %s", base_url, exc.__class__.__name__)
-            continue
-        except ValueError:
-            logger.warning("Piped transcript mirror returned invalid JSON at %s", base_url)
-            continue
-
-        tracks = payload.get("subtitles") or payload.get("captions") or []
-        if not isinstance(tracks, list):
-            continue
-
-        segments = _try_caption_tracks(base_url, tracks)
-        if not segments:
-            continue
-
-        logger.info("YouTube transcript fetch succeeded using Piped mirror %s", base_url)
-        return {
-            "title": payload.get("title") or "YouTube Video",
-            "channel": payload.get("uploader") or payload.get("uploaderName") or payload.get("channel") or "",
-            "duration": payload.get("duration"),
-            "thumbnail": payload.get("thumbnailUrl") or payload.get("thumbnail") or "",
-            "segments": segments,
-        }
-    return None
-
-
-def _fetch_invidious_transcript(video_id: str) -> Optional[dict[str, Any]]:
-    for base_url in _configured_instances("INVIDIOUS_API_INSTANCES", INVIDIOUS_API_INSTANCES):
-        try:
-            response = requests.get(f"{base_url}/api/v1/videos/{video_id}", timeout=TRANSCRIPT_REQUEST_TIMEOUT)
-            response.raise_for_status()
-            payload = response.json()
-        except requests.exceptions.RequestException as exc:
-            logger.warning("Invidious transcript mirror failed at %s: %s", base_url, exc.__class__.__name__)
-            continue
-        except ValueError:
-            logger.warning("Invidious transcript mirror returned invalid JSON at %s", base_url)
-            continue
-
-        tracks = payload.get("captions") or payload.get("subtitles") or []
-        if not isinstance(tracks, list):
-            continue
-
-        segments = _try_caption_tracks(base_url, tracks)
-        if not segments:
-            continue
-
-        thumbnails = payload.get("videoThumbnails") or []
-        thumbnail = thumbnails[-1].get("url", "") if thumbnails and isinstance(thumbnails[-1], dict) else ""
-        logger.info("YouTube transcript fetch succeeded using Invidious mirror %s", base_url)
-        return {
-            "title": payload.get("title") or "YouTube Video",
-            "channel": payload.get("author") or payload.get("authorId") or "",
-            "duration": payload.get("lengthSeconds"),
-            "thumbnail": thumbnail,
-            "segments": segments,
-        }
-    return None
-
-
-def _fetch_transcript_from_free_mirrors(video_id: str) -> dict[str, Any]:
-    mirror_result = _fetch_piped_transcript(video_id) or _fetch_invidious_transcript(video_id)
-    if mirror_result:
-        return mirror_result
-    raise TranscriptUnavailableError(
-        "Could not fetch captions from YouTube or the free transcript mirrors. Please try again shortly or use another video with captions enabled."
-    )
-
-
-def _transcript_error(exc: Exception) -> TranscriptUnavailableError:
-    if isinstance(exc, TranscriptUnavailableError):
-        return exc
-    if isinstance(exc, (NoTranscriptFound, TranscriptsDisabled)):
-        return TranscriptUnavailableError(
-            "No captions were found for this video. Try a YouTube video with captions or automatic captions enabled.",
-            status_code=422,
-        )
-    if isinstance(exc, AgeRestricted):
-        return TranscriptUnavailableError(
-            "This video is age-restricted, so its captions cannot be retrieved without YouTube authentication.",
-            status_code=422,
-        )
-    if isinstance(exc, (InvalidVideoId, VideoUnavailable)):
-        return TranscriptUnavailableError(
-            "Could not read this YouTube video. Please check the URL or try another video with captions enabled.",
-            status_code=422,
-        )
-    if isinstance(exc, (RequestBlocked, IpBlocked)):
-        return TranscriptUnavailableError(
-            "YouTube is temporarily blocking transcript requests from this server, and the free transcript mirrors did not have usable captions. Please try again shortly or use another video with captions enabled.",
-            status_code=429,
-        )
-    if isinstance(exc, CouldNotRetrieveTranscript):
-        return TranscriptUnavailableError(
-            "Could not download captions for this video. Please try again shortly or use another video with captions enabled."
-        )
-    return TranscriptUnavailableError(
-        "Could not read captions for this video after trying YouTube and free transcript mirrors. Please try again shortly or use another video with captions enabled."
-    )
-
-
-def get_video_transcript(youtube_url: str) -> dict[str, Any]:
-    video_id = _extract_youtube_video_id(youtube_url)
-    metadata = _video_metadata(youtube_url, video_id)
+def _request_transcript_from_service(youtube_url: str, video_id: str, language: Optional[str]) -> dict[str, Any]:
+    service_url = f"{TRANSCRIPT_SERVICE_URL}/transcript"
+    payload = {"youtube_url": youtube_url, "video_id": video_id}
+    if language:
+        payload["language"] = language
 
     try:
-        fetched_transcript, connection_label = _fetch_transcript(video_id)
-        segments = _fetched_transcript_to_segments(fetched_transcript)
-        logger.info("Transcript source selected: %s", connection_label)
-    except Exception as exc:
-        logger.warning("Primary YouTube transcript fetch failed; trying free transcript mirrors: %s", exc.__class__.__name__)
-        try:
-            mirror_result = _fetch_transcript_from_free_mirrors(video_id)
-        except Exception as mirror_exc:
-            raise _transcript_error(exc) from mirror_exc
-        segments = mirror_result["segments"]
-        metadata = {
-            "title": mirror_result.get("title") or metadata["title"],
-            "channel": mirror_result.get("channel") or metadata["channel"],
-            "duration": mirror_result.get("duration") or metadata["duration"],
-            "thumbnail": mirror_result.get("thumbnail") or metadata["thumbnail"],
-        }
+        response = requests.post(service_url, json=payload, timeout=TRANSCRIPT_SERVICE_TIMEOUT)
+    except requests.exceptions.RequestException as exc:
+        logger.exception("Transcript service request failed: %s", exc.__class__.__name__)
+        raise TranscriptUnavailableError(
+            "Transcript service is temporarily unavailable. Please try again shortly.",
+            status_code=503,
+        ) from exc
 
+    try:
+        data = response.json()
+    except ValueError as exc:
+        logger.error("Transcript service returned a non-JSON response with status %s", response.status_code)
+        raise TranscriptUnavailableError(
+            "Transcript service returned an invalid response. Please try again shortly.",
+            status_code=502,
+        ) from exc
+
+    if response.status_code >= 500:
+        logger.error("Transcript service error %s: %s", response.status_code, data.get("error"))
+        raise TranscriptUnavailableError(
+            "Transcript service is temporarily unavailable. Please try again shortly.",
+            status_code=502,
+        )
+
+    if not data.get("success"):
+        message = str(data.get("error") or "No captions were found for this video.")
+        status_code = 422 if response.status_code == 422 or _is_caption_unavailable_error(message) else 502
+        raise TranscriptUnavailableError(message, status_code=status_code)
+
+    return data
+
+
+def get_video_transcript(youtube_url: str, language: Optional[str] = None) -> dict[str, Any]:
+    video_id = _extract_youtube_video_id(youtube_url)
+    metadata = _video_metadata(youtube_url, video_id)
+    data = _request_transcript_from_service(youtube_url, video_id, language)
+
+    transcript = _clean_caption_text(str(data.get("transcript") or ""))
+    segments = _normalize_caption_segments(data.get("segments"), transcript)
     if not segments:
         raise TranscriptUnavailableError(
             "No usable captions were found for this video. Try a YouTube video with captions or automatic captions enabled.",
             status_code=422,
         )
 
+    if not transcript:
+        transcript = " ".join(segment["text"] for segment in segments)
+
     duration = int(max(segment.get("end_seconds", 0) for segment in segments)) if segments else None
+    logger.info(
+        "Transcript service returned %s grouped caption segments in %s for video %s",
+        len(segments),
+        data.get("language") or language or "default language",
+        video_id,
+    )
     return {
-        "title": metadata["title"],
-        "channel": metadata["channel"],
-        "duration": duration,
-        "thumbnail": metadata["thumbnail"],
-        "transcript": " ".join(segment["text"] for segment in segments),
+        "title": data.get("title") or metadata["title"],
+        "channel": data.get("channel") or metadata["channel"],
+        "duration": data.get("duration") or duration,
+        "thumbnail": data.get("thumbnail") or metadata["thumbnail"],
+        "transcript": transcript,
         "caption_segments": segments,
         "caption_windows": build_caption_windows(segments, duration),
     }
-
 
 async def generate_synopsis(
     transcript: str, mode: str = "normal", custom_prompt: Optional[str] = None,
@@ -949,4 +590,6 @@ async def improve_slide_content(slide: dict[str, Any], context: Optional[dict[st
         slot="presentation",
     )
     return data.get("slide", slide)
+
+
 

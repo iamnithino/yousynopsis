@@ -1,4 +1,4 @@
-from typing import Any, Optional
+﻿from typing import Any, Optional
 
 import datetime
 import os
@@ -40,7 +40,7 @@ app = FastAPI(
 )
 
 default_allowed_origins = [
-
+    
     "https://your-render-service.onrender.com",
 ]
 
@@ -49,6 +49,7 @@ env_allowed_origins = [
     for origin in os.environ.get("CORS_ORIGINS", "").split(",")
     if origin.strip()
 ]
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -436,7 +437,7 @@ async def summarize_video(
     current_user: User = Depends(get_current_user),
 ):
     try:
-        video = get_video_transcript(request.youtube_url)
+        video = get_video_transcript(request.youtube_url, request.output_language or "English")
         caption_summaries = await summarize_caption_windows(video.get("caption_windows", []))
         generated = await generate_all_features(
             video["transcript"], request.mode, request.custom_prompt, request.output_language or "English"
@@ -493,8 +494,8 @@ async def compare_videos(
         return {"message": "Cached comparison loaded", "data": serialize_comparison(existing)}
 
     try:
-        video_1 = get_video_transcript(request.youtube_url_1)
-        video_2 = get_video_transcript(request.youtube_url_2)
+        video_1 = get_video_transcript(request.youtube_url_1, request.output_language or "English")
+        video_2 = get_video_transcript(request.youtube_url_2, request.output_language or "English")
         generated = await generate_video_comparison(
             video_1,
             video_2,
@@ -537,7 +538,7 @@ async def get_features(
         transcript = request.transcript
         caption_segments = []
         if not transcript:
-            video = get_video_transcript(request.youtube_url)
+            video = get_video_transcript(request.youtube_url, request.output_language or "English")
             transcript = video["transcript"]
             caption_segments = video.get("caption_segments", [])
             caption_windows = video.get("caption_windows", [])
@@ -573,7 +574,7 @@ async def hydrate_saved_summary(
         video: dict[str, Any] = {}
         if needs_video:
             try:
-                video = get_video_transcript(row.youtube_url)
+                video = get_video_transcript(row.youtube_url, row.language or "English")
                 row.title = row.title or video.get("title", "YouTube Video")
                 row.channel = row.channel or video.get("channel", "")
                 row.duration = row.duration or video.get("duration")

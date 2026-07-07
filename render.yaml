@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: yousynopsis-backend
+    name: synopsis-ai-backend
     runtime: python
     repo: https://github.com/iamnithino/yousynopsis
     rootDir: backend/
@@ -9,3 +9,25 @@ services:
     envVars:
       - key: PORT
         value: 10000
+      - key: TRANSCRIPT_SERVICE_HOST
+        fromService:
+          type: pserv
+          name: synopsis-ai-transcript-service
+          property: host
+      - key: TRANSCRIPT_SERVICE_PORT
+        value: 3001
+      - key: TRANSCRIPT_SERVICE_TIMEOUT
+        value: 30
+
+  - type: pserv
+    name: synopsis-ai-transcript-service
+    runtime: node
+    repo: https://github.com/iamnithino/yousynopsis
+    rootDir: transcript-service/
+    buildCommand: npm ci
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 3001
+      - key: CAPTION_GROUP_SECONDS
+        value: 45

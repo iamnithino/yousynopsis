@@ -1,0 +1,21 @@
+{
+  "name": "synopsis-ai-transcript-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Lightweight YouTube transcript microservice for Synopsis AI.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "cors": "2.8.5",
+    "dotenv": "16.4.7",
+    "express": "^4.22.2",
+    "youtube-caption-extractor": "1.10.2"
+  }
+}
